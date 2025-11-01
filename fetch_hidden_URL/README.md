@@ -10,6 +10,7 @@ From the `fetch_hidden_URL` directory:
 python fetch_url.py -u https://example.com
 python fetch_url.py -u https://example.com -o example.html
 ```
+here is some interesting things happened, when I run the second commond the result is different from the first one. It do not included the hidden code
 
 Options
 

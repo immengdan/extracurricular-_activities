@@ -1,18 +1,21 @@
+"""Simple HTML fetcher (no argparse)
 
-"""Simple HTML fetcher
+Usage (env/interactive):
+ - Set FETCH_URL environment variable to the URL to fetch, and optionally FETCH_OUTPUT to save to a file.
+   Example:
+     FETCH_URL="https://example.com" FETCH_OUTPUT=page.html python fetch_html.py
+ - If FETCH_URL is not set, the script will prompt you to type or paste the URL on stdin.
+ - If FETCH_OUTPUT is not set, the HTML will be written to stdout.
 
-Usage (CLI):
-	python fetch_url.py -u https://example.com
-	python fetch_url.py --url https://example.com -o page.html
-
-This script fetches the HTML of a given URL with retries and a timeout.
+This variant removes argparse entirely and uses environment variables (or an interactive prompt)
+so there are no CLI argument parsers.
 """
 
 from __future__ import annotations
 
-import argparse
+import os
 import sys
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Iterator
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -28,19 +31,19 @@ def _default_headers() -> Dict[str, str]:
 	}
 
 
-def fetch_html(
+def fetch_html_stream(
 	url: str,
 	timeout: float = 10.0,
 	retries: int = 3,
 	backoff_factor: float = 0.3,
 	headers: Optional[Dict[str, str]] = None,
 	verify: bool = True,
-) -> Tuple[int, str]:
-	"""Fetch HTML content for `url`.
+	stream: bool = True,
+) -> Tuple[int, Iterator[bytes]]:
+	"""Fetch response as a byte stream for `url`.
 
-	Returns (status_code, text). Raises requests.RequestException on network errors.
+	Returns (status_code, iterator_of_bytes). Raises requests.RequestException on network errors.
 	"""
-
 	session = requests.Session()
 
 	retry = Retry(
@@ -60,51 +63,89 @@ def fetch_html(
 	if headers:
 		use_headers.update(headers)
 
-	resp = session.get(url, headers=use_headers, timeout=timeout, verify=verify)
+	resp = session.get(url, headers=use_headers, timeout=timeout, verify=verify, stream=stream)
 	resp.raise_for_status()
-	return resp.status_code, resp.text
+
+	return resp.status_code, resp.iter_content(chunk_size=8192)
 
 
-def _build_argparser() -> argparse.ArgumentParser:
-	p = argparse.ArgumentParser(description="Fetch HTML for a given URL")
-	p.add_argument("-u", "--url", required=True, help="URL to fetch (http/https)")
-	p.add_argument(
-		"-o",
-		"--output",
-		help="Optional output file to save HTML. If omitted, prints to stdout.",
-	)
-	p.add_argument("--timeout", type=float, default=10.0, help="Request timeout in seconds")
-	p.add_argument("--retries", type=int, default=3, help="Number of retries on failure")
-	p.add_argument("--no-verify", dest="verify", action="store_false", help="Disable TLS cert verification (not recommended)")
-	return p
+def _get_inputs_from_env_or_stdin() -> Tuple[str, Optional[str]]:
+	"""
+	Return (url, output_path).
+	- URL preference order:
+	  1) FETCH_URL env var
+	  2) prompt the user on stdin
+	- Output path:
+	  - FETCH_OUTPUT env var or None (stdout)
+	"""
+	url = os.environ.get("FETCH_URL")
+	if not url:
+		# Prompt the user for a URL. If stdin is not interactive, read one line.
+		if sys.stdin.isatty():
+			try:
+				url = input("Enter URL to fetch: ").strip()
+			except EOFError:
+				url = ""
+		else:
+			# Non-interactive stdin (e.g., piped). Read first non-empty line.
+			lines = sys.stdin.read().splitlines()
+			url = next((ln.strip() for ln in lines if ln.strip()), "")
+	# Normalize empty to None to handle error below
+	if not url:
+		print("No URL provided. Set FETCH_URL environment variable or provide via stdin.", file=sys.stderr)
+		raise SystemExit(2)
+
+	output = os.environ.get("FETCH_OUTPUT")  # None => write to stdout
+	return url, output
 
 
-def main(argv: Optional[list[str]] = None) -> int:
-	argv = argv if argv is not None else sys.argv[1:]
-	parser = _build_argparser()
-	args = parser.parse_args(argv)
+def main() -> int:
+	# Configurable defaults (can be adjusted or made environment-driven if desired)
+	timeout = float(os.environ.get("FETCH_TIMEOUT", "10.0"))
+	retries = int(os.environ.get("FETCH_RETRIES", "3"))
+	verify_env = os.environ.get("FETCH_VERIFY")
+	# If FETCH_VERIFY is explicitly set to "0" or "false" (case-insensitive), disable verify.
+	if verify_env is None:
+		verify = True
+	else:
+		verify = not (verify_env.strip().lower() in ("0", "false", "no"))
 
 	try:
-		status, html = fetch_html(args.url, timeout=args.timeout, retries=args.retries, verify=args.verify)
+		url, output = _get_inputs_from_env_or_stdin()
+	except SystemExit as e:
+		return int(e.code or 1)
+
+	try:
+		status, byte_iter = fetch_html_stream(url, timeout=timeout, retries=retries, verify=verify)
 	except requests.RequestException as e:
-		print(f"Error fetching {args.url}: {e}", file=sys.stderr)
+		print(f"Error fetching {url}: {e}", file=sys.stderr)
 		return 2
 
-	if args.output:
+	if output:
 		try:
-			with open(args.output, "w", encoding="utf-8") as f:
-				f.write(html)
+			with open(output, "wb") as f:
+				for chunk in byte_iter:
+					if chunk:
+						f.write(chunk)
 		except OSError as e:
-			print(f"Error writing to {args.output}: {e}", file=sys.stderr)
+			print(f"Error writing to {output}: {e}", file=sys.stderr)
 			return 3
-		print(f"Saved {status} HTML to {args.output}")
+		print(f"Saved {status} HTML to {output}")
 	else:
-		# Print HTML to stdout
-		print(html)
+		out = getattr(sys.stdout, "buffer", None)
+		if out is None:
+			# Fallback: decode using utf-8 with replacement for errors.
+			for chunk in byte_iter:
+				if chunk:
+					sys.stdout.write(chunk.decode("utf-8", errors="replace"))
+		else:
+			for chunk in byte_iter:
+				if chunk:
+					out.write(chunk)
+			out.flush()
 
 	return 0
 
 
 if __name__ == "__main__":
 	raise SystemExit(main())
-
